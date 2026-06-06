@@ -2,36 +2,70 @@ const QUEUE_KEY = 'code-review-agent:review-jobs';
 const SEEN_PREFIX = 'code-review-agent:seen';
 
 const state = {
-  worker: null,
+  handlers: {},
   logger: console,
   redisUrl: '',
   redisToken: '',
   localQueue: [],
-  processing: false
+  processing: false,
+  concurrency: 1,
+  activeJobs: 0
 };
 
-export function configureQueue({ worker, logger, redisUrl, redisToken }) {
-  state.worker = worker;
+export function configureQueue({ handlers, worker, logger, redisUrl, redisToken, concurrency = 1 }) {
+  state.handlers = handlers || { pull_request_review: worker };
   state.logger = logger || console;
   state.redisUrl = (redisUrl || '').replace(/\/+$/, '');
   state.redisToken = redisToken || '';
+  state.concurrency = 1;
+
+  if (concurrency !== 1) {
+    state.logger.warn({ requestedConcurrency: concurrency }, 'Queue concurrency is pinned to 1 to protect free-tier API rate limits.');
+  }
 }
 
 export async function enqueueReview(job) {
-  if (!state.worker) {
+  return enqueueJob('pull_request_review', job, {
+    dedupeKey: `${SEEN_PREFIX}:pull_request_review:${job.fullName}:${job.prNumber}:${job.headSha}`,
+    dedupeTtlSeconds: 60 * 60
+  });
+}
+
+export async function enqueueConversationalReply(job) {
+  return enqueueJob('conversational_reply', job, {
+    dedupeKey: `${SEEN_PREFIX}:conversational_reply:${job.fullName}:${job.prNumber}:${job.commentId}`,
+    dedupeTtlSeconds: 60 * 30
+  });
+}
+
+export async function enqueueJob(name, data, options = {}) {
+  if (!state.handlers[name]) {
     throw new Error('Queue worker is not configured.');
   }
 
-  const dedupeKey = `${SEEN_PREFIX}:${job.fullName}:${job.prNumber}:${job.headSha}`;
+  const job = {
+    name,
+    data,
+    enqueuedAt: new Date().toISOString()
+  };
+
+  if (hasRedis() && options.dedupeKey) {
+    try {
+      const setResult = await redisCommand('SET', options.dedupeKey, '1', 'NX', 'EX', options.dedupeTtlSeconds || 60 * 60);
+      if (setResult !== 'OK') {
+        state.logger.info({ job }, 'Skipped duplicate queue job.');
+        return { queued: false, duplicate: true };
+      }
+    } catch (error) {
+      state.logger.warn({ err: error }, 'Redis queue unavailable; falling back to in-memory queue.');
+      state.localQueue.push(job);
+      void drainQueue();
+      return { queued: true, duplicate: false, fallback: true };
+    }
+  }
 
   if (hasRedis()) {
     try {
-      const setResult = await redisCommand('SET', dedupeKey, '1', 'NX', 'EX', 60 * 60);
-      if (setResult !== 'OK') {
-        state.logger.info({ job }, 'Skipped duplicate review job.');
-        return { queued: false, duplicate: true };
-      }
-
       await redisCommand('LPUSH', QUEUE_KEY, JSON.stringify(job));
       void drainQueue();
       return { queued: true, duplicate: false };
@@ -46,11 +80,12 @@ export async function enqueueReview(job) {
 }
 
 export async function drainQueue() {
-  if (state.processing) {
+  if (state.processing || state.activeJobs >= state.concurrency) {
     return;
   }
 
   state.processing = true;
+  state.activeJobs += 1;
   try {
     while (true) {
       const job = await nextJob();
@@ -59,12 +94,20 @@ export async function drainQueue() {
       }
 
       try {
-        await state.worker(job);
+        const normalizedJob = normalizeJob(job);
+        const handler = state.handlers[normalizedJob.name];
+        if (!handler) {
+          state.logger.warn({ job: normalizedJob }, 'Skipped queue job with no registered handler.');
+          continue;
+        }
+
+        await handler(normalizedJob.data);
       } catch (error) {
         state.logger.error({ err: error, job }, 'Review job failed.');
       }
     }
   } finally {
+    state.activeJobs -= 1;
     state.processing = false;
   }
 }
@@ -89,6 +132,17 @@ async function nextJob() {
   }
 
   return state.localQueue.shift() || null;
+}
+
+function normalizeJob(job) {
+  if (job?.name && job?.data) {
+    return job;
+  }
+
+  return {
+    name: 'pull_request_review',
+    data: job
+  };
 }
 
 async function redisCommand(command, ...args) {

@@ -5,10 +5,12 @@ import helmet from 'helmet';
 import pino from 'pino';
 import pinoHttp from 'pino-http';
 import { createHealthRouter } from './health.js';
-import { configureQueue, closeQueue, enqueueReview } from './queue.js';
+import { configureQueue, closeQueue, enqueueReview, enqueueConversationalReply } from './queue.js';
 import { createWebhookHandler } from './webhook.js';
 import { reviewPullRequest } from './reviewer.js';
 import { postReviewResult } from './commenter.js';
+import { createDashboardRouter } from './dashboardRouter.js';
+import { handleConversationalReply } from './chatWorker.js';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const config = loadConfig();
@@ -17,11 +19,19 @@ configureQueue({
   redisUrl: config.upstashRedisRestUrl,
   redisToken: config.upstashRedisRestToken,
   logger,
-  worker: async (job) => {
-    logger.info({ job }, 'Starting pull request review.');
-    const result = await reviewPullRequest(job, config, logger);
-    const postResult = await postReviewResult(job, result, config, logger);
-    logger.info({ job, result, postResult }, 'Finished pull request review.');
+  concurrency: 1,
+  handlers: {
+    pull_request_review: async (job) => {
+      logger.info({ job }, 'Starting pull request review.');
+      const result = await reviewPullRequest(job, config, logger);
+      const postResult = await postReviewResult(job, result, config, logger);
+      logger.info({ job, result, postResult }, 'Finished pull request review.');
+    },
+    conversational_reply: async (job) => {
+      logger.info({ job }, 'Starting conversational PR reply.');
+      const postResult = await handleConversationalReply(job, config, logger);
+      logger.info({ job, postResult }, 'Finished conversational PR reply.');
+    }
   }
 });
 
@@ -33,10 +43,11 @@ app.get('/health', (_req, res) => {
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(pinoHttp({ logger }));
 app.use(createHealthRouter());
+app.use(createDashboardRouter({ logger }));
 app.post(
   '/webhook',
   express.raw({ type: '*/*', limit: '4mb' }),
-  createWebhookHandler({ config, logger, enqueueReview })
+  createWebhookHandler({ config, logger, enqueueReview, enqueueConversationalReply })
 );
 
 const server = app.listen(config.port, '0.0.0.0', () => {

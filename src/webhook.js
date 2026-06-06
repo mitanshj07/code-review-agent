@@ -1,8 +1,10 @@
 import crypto from 'node:crypto';
 
 const REVIEWABLE_ACTIONS = new Set(['opened', 'synchronize', 'reopened', 'ready_for_review']);
+const BOT_MENTION = '@codescopeboit';
+const BOT_LOGINS = new Set(['codescopeboit[bot]', 'codescopeboit']);
 
-export function createWebhookHandler({ config, logger, enqueueReview }) {
+export function createWebhookHandler({ config, logger, enqueueReview, enqueueConversationalReply }) {
   return async function webhookHandler(req, res) {
     const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(req.body || '');
 
@@ -24,6 +26,16 @@ export function createWebhookHandler({ config, logger, enqueueReview }) {
     if (event === 'ping') {
       logger.info({ deliveryId }, 'Received GitHub ping.');
       return res.json({ status: 'ok', event: 'ping' });
+    }
+
+    if (event === 'issue_comment') {
+      return handleIssueComment({
+        payload,
+        deliveryId,
+        logger,
+        enqueueConversationalReply,
+        res
+      });
     }
 
     if (event !== 'pull_request') {
@@ -72,6 +84,65 @@ export function createWebhookHandler({ config, logger, enqueueReview }) {
       pullRequest: job.prNumber
     });
   };
+}
+
+async function handleIssueComment({ payload, deliveryId, logger, enqueueConversationalReply, res }) {
+  if (payload.action !== 'created') {
+    return res.status(200).json({ status: 'ignored', reason: `Unsupported action: ${payload.action}` });
+  }
+
+  const comment = payload.comment;
+  const issue = payload.issue;
+  const repository = payload.repository;
+
+  if (!comment || !issue || !repository) {
+    return res.status(400).json({ error: 'Missing issue_comment payload fields' });
+  }
+
+  const commentAuthorLogin = comment.user?.login || '';
+  const commentAuthorType = comment.user?.type || '';
+
+  if (commentAuthorType === 'Bot' || BOT_LOGINS.has(commentAuthorLogin.toLowerCase())) {
+    logger.info({ deliveryId, commentId: comment.id, commentAuthorLogin }, 'Ignored bot-authored issue comment.');
+    return res.status(200).json({ status: 'ignored', reason: 'bot_comment' });
+  }
+
+  const body = comment.body || '';
+  if (!body.includes(BOT_MENTION)) {
+    return res.status(200).json({ status: 'ignored', reason: 'missing_bot_mention' });
+  }
+
+  if (!issue.pull_request) {
+    return res.status(200).json({ status: 'ignored', reason: 'not_a_pull_request_comment' });
+  }
+
+  if (!payload.installation?.id) {
+    return res.status(400).json({ error: 'Missing GitHub App installation id' });
+  }
+
+  const job = {
+    deliveryId,
+    installationId: payload.installation.id,
+    owner: repository.owner.login,
+    repo: repository.name,
+    fullName: repository.full_name,
+    prNumber: issue.number,
+    body,
+    commentId: comment.id,
+    sender: commentAuthorLogin || payload.sender?.login || 'unknown',
+    enqueuedAt: new Date().toISOString()
+  };
+
+  const queueResult = await enqueueConversationalReply(job);
+  logger.info({ job, queueResult }, 'Conversational PR reply job accepted.');
+
+  return res.status(202).json({
+    status: queueResult.duplicate ? 'duplicate' : 'queued',
+    deliveryId,
+    repository: job.fullName,
+    pullRequest: job.prNumber,
+    commentId: job.commentId
+  });
 }
 
 function verifySignature(body, signature, secret) {

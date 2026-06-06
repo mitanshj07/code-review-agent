@@ -10,7 +10,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "health": "node -e \"fetch('http://localhost:' + (process.env.PORT || 3000) + '/health').then(r => r.json()).then(console.log)\""
+    "health": "node -e \"fetch('http://localhost:' + (process.env.PORT || 3000) + '/health').then(r => r.text()).then(console.log)\""
   },
   "keywords": [
     "github-app",

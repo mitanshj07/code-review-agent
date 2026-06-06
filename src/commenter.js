@@ -64,6 +64,22 @@ export async function postReviewResult(job, result, config, logger) {
   }
 }
 
+export async function postConversationalReply(job, markdownReply, config, logger) {
+  const octokit = await createInstallationClient(config, job.installationId);
+  const cleanReply = sanitizeMarkdownReply(markdownReply);
+  const target = job.sender && job.sender !== 'unknown' ? `@${job.sender}` : 'Developer';
+
+  const response = await octokit.rest.issues.createComment({
+    owner: job.owner,
+    repo: job.repo,
+    issue_number: job.prNumber,
+    body: `${target} [AI Response]:\n\n${cleanReply}`
+  });
+
+  logger.info({ commentId: response.data.id, prNumber: job.prNumber, repository: job.fullName }, 'Posted conversational PR reply.');
+  return { posted: true, issueCommentId: response.data.id };
+}
+
 async function createInstallationClient(config, installationId) {
   const auth = createAppAuth({
     appId: config.githubAppId,
@@ -83,4 +99,13 @@ function formatFinding(finding) {
     '',
     `_Source: ${finding.source === 'static' ? 'deterministic check' : 'Groq review'}_`
   ].join('\n');
+}
+
+function sanitizeMarkdownReply(markdownReply) {
+  const reply = String(markdownReply || '').trim();
+  if (!reply) {
+    return 'I could not generate a useful response for this thread. Please clarify what you want me to review.';
+  }
+
+  return reply.slice(0, 6000);
 }
