@@ -27,6 +27,9 @@ configureQueue({
 
 const app = express();
 app.disable('x-powered-by');
+app.get('/health', (_req, res) => {
+  res.status(200).type('text/plain').send('OK');
+});
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(pinoHttp({ logger }));
 app.use(createHealthRouter());
@@ -36,8 +39,8 @@ app.post(
   createWebhookHandler({ config, logger, enqueueReview })
 );
 
-const server = app.listen(config.port, () => {
-  logger.info({ port: config.port }, 'Code Review Agent listening.');
+const server = app.listen(config.port, '0.0.0.0', () => {
+  logger.info({ host: '0.0.0.0', port: config.port }, 'Code Review Agent listening.');
 });
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
