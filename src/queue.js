@@ -153,6 +153,12 @@ export const redis = {
     }
     return redisCommand('DBSIZE');
   },
+  pipeline: async (commands) => {
+    if (!hasRedis() || !commands.length) {
+      return [];
+    }
+    return redisPipeline(commands);
+  },
   command: redisCommand,
   isConfigured: hasRedis
 };
@@ -207,4 +213,27 @@ async function redisCommand(command, ...args) {
   }
 
   return payload.result;
+}
+
+async function redisPipeline(commands) {
+  const response = await fetch(`${state.redisUrl}/pipeline`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${state.redisToken}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(commands)
+  });
+
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`Upstash Redis pipeline failed with ${response.status}: ${body}`);
+  }
+
+  const payload = await response.json();
+  if (Array.isArray(payload) && payload.some((item) => item.error)) {
+    throw new Error(`Upstash Redis pipeline failed: ${JSON.stringify(payload)}`);
+  }
+
+  return payload;
 }

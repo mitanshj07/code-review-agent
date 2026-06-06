@@ -63,6 +63,30 @@ export function scanFileSizeFindings(files = []) {
   return findings;
 }
 
+export function scanTestColocationFindings(files = []) {
+  const paths = files.map((file) => file.filename || '').filter(Boolean);
+  const hasTestChange = paths.some(isTestPath);
+  if (hasTestChange) {
+    return [];
+  }
+
+  const coreFiles = paths.filter(isCoreLogicPath);
+  if (!coreFiles.length) {
+    return [];
+  }
+
+  return [{
+    path: coreFiles[0],
+    line: 1,
+    severity: 'warning',
+    category: 'maintainability',
+    title: 'Core logic changed without nearby tests',
+    body: `This PR changes ${coreFiles.slice(0, 3).map((file) => `\`${file}\``).join(', ')} without modifying a test file. Add or update colocated tests before merging.`,
+    source: 'test-colocation-guard',
+    global: true
+  }];
+}
+
 function buildFinding({ path, title, body, estimatedKb }) {
   return {
     path,
@@ -86,4 +110,14 @@ function countAddedLines(patch) {
 function extensionFor(filename) {
   const dotIndex = filename.lastIndexOf('.');
   return dotIndex === -1 ? '' : filename.slice(dotIndex).toLowerCase();
+}
+
+function isCoreLogicPath(path) {
+  return /^(src|lib)\//.test(path) &&
+    !isTestPath(path) &&
+    /\.(js|jsx|ts|tsx|mjs|cjs|py|go|rs|java)$/i.test(path);
+}
+
+function isTestPath(path) {
+  return /(^|\/)(tests?|__tests__)\//i.test(path) || /\.(test|spec)\./i.test(path);
 }

@@ -17,6 +17,9 @@ An autonomous GitHub App webhook service that reviews pull requests, posts inlin
 - Blocks massive PRs from auto-review to preserve free-tier API quota.
 - Adds PR size cards, auto-labels, commit-message suggestions, branch-name warnings, and smart reviewer assignment.
 - Runs a daily stale-PR reminder cron with Redis dedupe.
+- Adds zero-cost development guards for env sync, production leaks, missing tests, supply-chain bloat, markdown links, semantic PR titles, raw SQL, and risky regexes.
+- Uses standalone Gemini 1.5 Flash modules for release notes and architecture review when `GEMINI_API_KEY` is configured.
+- Seeds demo telemetry through `POST /api/demo/seed` using one Upstash Redis pipeline request.
 - Serves a CodeScope dashboard with repository metrics, PR scan activity, vulnerability trends, and a Team Health leaderboard.
 - Uses Upstash Redis for duplicate suppression and queueing when configured.
 - Exposes `GET /health` for deployment health checks.
@@ -38,6 +41,7 @@ The service listens on `PORT` and exposes:
 - `GET /api/scans`
 - `GET /api/leaderboard`
 - `GET /health/cache`
+- `POST /api/demo/seed`
 
 ## GitHub App Permissions
 
@@ -69,6 +73,8 @@ Copy `.env.example` to `.env` and fill in the real values. Keep `.env` out of gi
 For hosted deployments, set `GITHUB_PRIVATE_KEY` to the PEM value with newlines escaped as `\n`, or mount the key file and set `GITHUB_PRIVATE_KEY_PATH`.
 
 Set `SECURITY_ALERT_WEBHOOK_URL` to a Discord or Slack incoming webhook to enable SecOps alerts. The app auto-detects Discord URLs; set `SECURITY_ALERT_PROVIDER=slack` or `discord` to force one.
+
+Set `GEMINI_API_KEY` to enable standalone Gemini release notes and architecture analysis. These modules are isolated from the existing Groq review path.
 
 ## Deployment
 

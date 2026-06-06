@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import { createInstallationClient } from './reviewer.js';
 import { buildDiffFromFiles } from './diffUtils.js';
 import { scanForSecrets } from './secretScanner.js';
-import { postBranchNameWarning, postSecretAlertComment } from './commenter.js';
+import { postBranchNameWarning, postIssueComment, postSecretAlertComment } from './commenter.js';
 import { sendSecretExposureAlert } from './securityAlerts.js';
 import { redis } from './queue.js';
 
@@ -10,6 +10,7 @@ const REVIEWABLE_ACTIONS = new Set(['opened', 'synchronize', 'reopened', 'ready_
 const BOT_MENTION = '@codescopeboit';
 const BOT_LOGINS = new Set(['codescopeboit[bot]', 'codescopeboit']);
 const BRANCH_NAME_PATTERN = /^(feat|fix|hotfix|chore|refactor|docs|test|ci)\/[a-z0-9-]+$/;
+const CONVENTIONAL_TITLE_PATTERN = /^(feat|fix|chore|docs|refactor|test|ci|hotfix)(\([^)]+\))?:\s+\S/;
 
 export function createWebhookHandler({ config, logger, enqueueReview, enqueueConversationalReply }) {
   return async function webhookHandler(req, res) {
@@ -87,6 +88,7 @@ export function createWebhookHandler({ config, logger, enqueueReview, enqueueCon
     if (payload.action === 'opened') {
       await trackPROpened(job, logger);
       await enforceBranchName(octokit, job, logger);
+      await enforceSemanticTitle(octokit, job, logger);
     }
 
     await runImmediateSecretScan(octokit, job, config, logger);
@@ -136,6 +138,29 @@ async function enforceBranchName(octokit, job, logger) {
     logger.info({ repository: job.fullName, prNumber: job.prNumber, branchName: job.branchName }, 'Posted branch naming warning.');
   } catch (error) {
     logger.warn({ err: error, repository: job.fullName, prNumber: job.prNumber }, 'Could not post branch naming warning.');
+  }
+}
+
+async function enforceSemanticTitle(octokit, job, logger) {
+  if (CONVENTIONAL_TITLE_PATTERN.test(job.prTitle || '')) {
+    return;
+  }
+
+  try {
+    await postIssueComment(octokit, job, [
+      '## PR title should use Conventional Commits',
+      '',
+      `Current title: \`${job.prTitle || '(empty)'}\``,
+      '',
+      'Please update the PR title to a semantic format such as:',
+      '',
+      '- `feat: add risk dashboard`',
+      '- `fix: handle empty scan response`',
+      '- `docs: clarify webhook setup`'
+    ].join('\n'));
+    logger.info({ repository: job.fullName, prNumber: job.prNumber, prTitle: job.prTitle }, 'Posted semantic title warning.');
+  } catch (error) {
+    logger.warn({ err: error, repository: job.fullName, prNumber: job.prNumber }, 'Could not post semantic title warning.');
   }
 }
 

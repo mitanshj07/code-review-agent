@@ -208,6 +208,7 @@ export default function CodeScopeDashboardPage() {
   const [scans, setScans] = useState(fallbackScans);
   const [leaderboard, setLeaderboard] = useState(fallbackLeaderboards.all);
   const [loading, setLoading] = useState(false);
+  const [seedState, setSeedState] = useState('idle');
 
   useEffect(() => {
     let cancelled = false;
@@ -278,6 +279,23 @@ export default function CodeScopeDashboardPage() {
     [metrics]
   );
 
+  async function seedDemoData() {
+    setSeedState('loading');
+    try {
+      const apiBaseUrl = process.env.NEXT_PUBLIC_API_BASE_URL || '';
+      const response = await fetch(`${apiBaseUrl}/api/demo/seed`, {
+        method: 'POST',
+        credentials: 'include'
+      });
+      if (!response.ok) {
+        throw new Error('Could not seed demo data');
+      }
+      setSeedState('success');
+    } catch {
+      setSeedState('error');
+    }
+  }
+
   return (
     <main className="min-h-screen bg-slate-950 text-slate-100">
       <div className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-6 py-6 lg:px-8">
@@ -290,20 +308,34 @@ export default function CodeScopeDashboardPage() {
             </p>
           </div>
 
-          <label className="flex w-full flex-col gap-2 text-sm text-slate-300 md:w-72">
-            Repository
-            <select
-              value={repository}
-              onChange={(event) => setRepository(event.target.value)}
-              className="h-11 rounded-md border border-white/10 bg-slate-900 px-3 text-sm text-white outline-none ring-cyan-400 transition focus:ring-2"
-            >
-              {repositories.map((repo) => (
-                <option key={repo.value} value={repo.value}>
-                  {repo.label}
-                </option>
-              ))}
-            </select>
-          </label>
+          <div className="flex w-full flex-col gap-3 md:w-80">
+            <label className="flex flex-col gap-2 text-sm text-slate-300">
+              Repository
+              <select
+                value={repository}
+                onChange={(event) => setRepository(event.target.value)}
+                className="h-11 rounded-md border border-white/10 bg-slate-900 px-3 text-sm text-white outline-none ring-cyan-400 transition focus:ring-2"
+              >
+                {repositories.map((repo) => (
+                  <option key={repo.value} value={repo.value}>
+                    {repo.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={seedDemoData}
+                disabled={seedState === 'loading'}
+                className="h-10 rounded-md border border-cyan-300/30 bg-cyan-300/10 px-3 text-sm font-medium text-cyan-100 transition hover:bg-cyan-300/20 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {seedState === 'loading' ? 'Seeding' : 'Seed Demo Data'}
+              </button>
+              {seedState === 'success' ? <span className="text-xs text-emerald-300">Seeded</span> : null}
+              {seedState === 'error' ? <span className="text-xs text-red-300">Failed</span> : null}
+            </div>
+          </div>
         </header>
 
         <section className="grid gap-4 md:grid-cols-3">

@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import express from 'express';
 import helmet from 'helmet';
@@ -19,6 +20,13 @@ import { lintPullRequestCommits, buildCommitLintSection } from './commitLinter.j
 import { labelPR } from './autoLabeler.js';
 import { assignReviewers } from './autoAssign.js';
 import { startStalePRReminder } from './stalePRReminder.js';
+import { scanDebtFindings } from './debtScanner.js';
+import { scanStaticDevGuardFindings } from './staticDevGuards.js';
+import { scanTestColocationFindings } from './fileGuards.js';
+import { buildStaticGuardSection } from './reviewSections.js';
+import { generateGeminiReleaseNotes } from './geminiReleaseNotes.js';
+import { generateGeminiArchitectureAnalysis } from './geminiArchitectureChecker.js';
+import { seedDemoTelemetry } from './telemetrySeeder.js';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const config = loadConfig();
@@ -52,6 +60,15 @@ configureQueue({
       }
 
       const result = await reviewPullRequest({ ...job, files, diff }, config, logger);
+      const staticGuardFindings = [
+        ...scanDebtFindings(diff),
+        ...scanStaticDevGuardFindings({ diff, files, repoRoot: process.cwd(), prTitle: job.prTitle }),
+        ...scanTestColocationFindings(files)
+      ];
+      if (staticGuardFindings.length) {
+        result.findings = [...staticGuardFindings, ...result.findings].slice(0, config.maxComments);
+      }
+
       const secretReviewFindings = secretFindings.map((finding) => ({
         ...finding,
         severity: 'error'
@@ -64,7 +81,9 @@ configureQueue({
 
       const commitIssues = await lintPullRequestCommits(octokit, job.owner, job.repo, job.prNumber, logger);
       const commitLintSection = buildCommitLintSection(commitIssues);
-      result.extraReviewSections = commitLintSection ? [commitLintSection] : [];
+      const staticGuardSection = buildStaticGuardSection(staticGuardFindings);
+      const architectureSection = await generateGeminiArchitectureAnalysis(diff, config, logger);
+      result.extraReviewSections = [commitLintSection, staticGuardSection, architectureSection].filter(Boolean);
 
       const labelResult = await labelPR(octokit, job.owner, job.repo, job.prNumber, diff, result.findings, sizeData, {
         groqApiKey: config.groqApiKey,
@@ -73,6 +92,10 @@ configureQueue({
       });
       const alertResult = await sendSecurityAlertsForReview(job, result, config, logger);
       const postResult = await postReviewResult(job, result, config, logger);
+      const releaseNotes = await generateGeminiReleaseNotes(diff, config, logger);
+      if (releaseNotes) {
+        await postIssueComment(octokit, job, releaseNotes);
+      }
       const assignResult = await assignReviewers(octokit, job.owner, job.repo, job.prNumber, job.sender, changedFiles, logger);
       logger.info({ job, result, labelResult, alertResult, postResult, assignResult }, 'Finished pull request review.');
     },
@@ -93,6 +116,13 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(pinoHttp({ logger }));
 app.use(createHealthRouter());
 app.use(createDashboardRouter({ logger }));
+app.post('/api/demo/seed', express.json({ limit: '64kb' }), requireDemoSeedAccess(config), async (_req, res, next) => {
+  try {
+    res.json(await seedDemoTelemetry(logger));
+  } catch (error) {
+    next(error);
+  }
+});
 app.post(
   '/webhook',
   express.raw({ type: '*/*', limit: '4mb' }),
@@ -132,7 +162,10 @@ function loadConfig() {
     securityAlertWebhookUrl: process.env.SECURITY_ALERT_WEBHOOK_URL || process.env.DISCORD_WEBHOOK_URL || process.env.SLACK_WEBHOOK_URL || '',
     securityAlertProvider: process.env.SECURITY_ALERT_PROVIDER || '',
     securityAlertMinSeverity: (process.env.SECURITY_ALERT_MIN_SEVERITY || 'high').toLowerCase(),
-    dashboardCorsOrigins: parseCsv(process.env.DASHBOARD_CORS_ORIGINS || 'http://localhost:3000')
+    dashboardCorsOrigins: parseCsv(process.env.DASHBOARD_CORS_ORIGINS || 'http://localhost:3000'),
+    geminiApiKey: process.env.GEMINI_API_KEY || '',
+    demoSeedToken: process.env.DEMO_SEED_TOKEN || '',
+    sessionSecret: process.env.SESSION_SECRET || process.env.GITHUB_WEBHOOK_SECRET || 'development-only-session-secret'
   };
 }
 
@@ -181,4 +214,50 @@ function parseCsv(value) {
     .split(',')
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+function requireDemoSeedAccess(config) {
+  return (req, res, next) => {
+    if (config.demoSeedToken && req.get('x-demo-seed-token') === config.demoSeedToken) {
+      return next();
+    }
+
+    const signedSession = parseCookieHeader(req.headers.cookie || '').codescope_session;
+    if (signedSession && verifySignedValue(signedSession, config.sessionSecret)) {
+      return next();
+    }
+
+    if (String(process.env.NODE_ENV || 'development') !== 'production' && !config.demoSeedToken) {
+      return next();
+    }
+
+    return res.status(403).json({ error: 'Demo seed access denied.' });
+  };
+}
+
+function parseCookieHeader(header) {
+  return String(header || '').split(';').reduce((memo, part) => {
+    const [name, ...valueParts] = part.trim().split('=');
+    if (name) {
+      memo[name] = decodeURIComponent(valueParts.join('='));
+    }
+    return memo;
+  }, {});
+}
+
+function verifySignedValue(signedValue, secret) {
+  const [encoded, signature] = String(signedValue || '').split('.');
+  if (!encoded || !signature) {
+    return null;
+  }
+
+  const expected = crypto.createHmac('sha256', secret).update(encoded).digest('base64url');
+  const actualBuffer = Buffer.from(signature);
+  const expectedBuffer = Buffer.from(expected);
+  if (actualBuffer.length !== expectedBuffer.length) {
+    return null;
+  }
+  return crypto.timingSafeEqual(actualBuffer, expectedBuffer)
+    ? Buffer.from(encoded, 'base64url').toString('utf8')
+    : null;
 }
