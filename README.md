@@ -12,6 +12,11 @@ An autonomous GitHub App webhook service that reviews pull requests, posts inlin
 - Posts inline review comments on changed lines, with GitHub native one-click suggestion blocks when a safe fix is available.
 - Replies to `@codescopeboit` mentions in PR conversations with Groq model failover.
 - Sends optional Discord or Slack security alerts for critical security findings.
+- Scans added diff lines for common hardcoded secrets before Groq runs.
+- Caches full-review and per-file review results in Upstash Redis to avoid duplicate Groq calls.
+- Blocks massive PRs from auto-review to preserve free-tier API quota.
+- Adds PR size cards, auto-labels, commit-message suggestions, branch-name warnings, and smart reviewer assignment.
+- Runs a daily stale-PR reminder cron with Redis dedupe.
 - Serves a CodeScope dashboard with repository metrics, PR scan activity, vulnerability trends, and a Team Health leaderboard.
 - Uses Upstash Redis for duplicate suppression and queueing when configured.
 - Exposes `GET /health` for deployment health checks.
@@ -32,6 +37,7 @@ The service listens on `PORT` and exposes:
 - `GET /api/metrics`
 - `GET /api/scans`
 - `GET /api/leaderboard`
+- `GET /health/cache`
 
 ## GitHub App Permissions
 
@@ -46,6 +52,15 @@ Subscribe the app to:
 
 - Pull request events
 - Issue comment events
+
+## Free-Tier Cost Profile
+
+- Secret scanning: 0 Groq calls.
+- Diff caching: reduces repeat Groq calls for unchanged diffs and files.
+- Auto reviewer assignment: 0 Groq calls, GitHub API only.
+- PR size guard: 0 Groq calls.
+- Auto labeler: rule-based first; at most 1 tiny `llama-3.1-8b-instant` call only when rules produce fewer than two labels.
+- Branch naming, commit linting, file-size guard, stale reminders, and review-time tracking: 0 Groq calls.
 
 ## Environment
 

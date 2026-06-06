@@ -9,10 +9,12 @@ const SECURITY_KEYWORDS = [
 ];
 
 const SEVERITY_RANK = {
-  critical: 0,
-  high: 1,
-  medium: 2,
-  low: 3
+  error: 0,
+  critical: 1,
+  high: 2,
+  warning: 3,
+  medium: 4,
+  low: 5
 };
 
 export async function sendSecurityAlertsForReview(job, result, config, logger = console) {
@@ -48,6 +50,41 @@ export async function sendSecurityAlertsForReview(job, result, config, logger = 
   } catch (error) {
     logger.warn({ err: error, provider, repository: job.fullName, prNumber: job.prNumber }, 'Security alert webhook failed.');
     return { sent: false, reason: 'webhook_failed', count: findings.length };
+  }
+}
+
+export async function sendSecretExposureAlert(job, secretFindings, config, logger = console) {
+  if (!secretFindings.length) {
+    return { sent: false, reason: 'no_secret_findings' };
+  }
+
+  if (!config.securityAlertWebhookUrl) {
+    return { sent: false, reason: 'webhook_not_configured', count: secretFindings.length };
+  }
+
+  const provider = inferProvider(config.securityAlertProvider, config.securityAlertWebhookUrl);
+  const secretTypes = [...new Set(secretFindings.map((finding) => finding.pattern))];
+  const payload = provider === 'discord'
+    ? buildSecretDiscordPayload(job, secretTypes)
+    : buildSecretSlackPayload(job, secretTypes);
+
+  try {
+    const response = await fetch(config.securityAlertWebhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`Secret alert webhook failed with ${response.status}: ${body.slice(0, 500)}`);
+    }
+
+    logger.info({ provider, repository: job.fullName, prNumber: job.prNumber, count: secretFindings.length }, 'Sent secret exposure alert webhook.');
+    return { sent: true, provider, count: secretFindings.length };
+  } catch (error) {
+    logger.warn({ err: error, provider, repository: job.fullName, prNumber: job.prNumber }, 'Secret exposure alert webhook failed.');
+    return { sent: false, reason: 'webhook_failed', count: secretFindings.length };
   }
 }
 
@@ -140,4 +177,49 @@ function buildHeadline(job, finding) {
 
 function formatFindingLine(finding) {
   return `*${String(finding.severity || 'high').toUpperCase()}* \`${finding.path}:${finding.line}\` ${finding.title}`;
+}
+
+function buildSecretSlackPayload(job, secretTypes) {
+  const headline = `Secret exposed in PR #${job.prNumber}`;
+  return {
+    text: headline,
+    blocks: [
+      {
+        type: 'section',
+        text: {
+          type: 'mrkdwn',
+          text: `*${headline}*\n*Repo:* ${job.fullName}\n*Author:* @${job.sender || 'unknown'}\n*Types:* ${secretTypes.join(', ')}`
+        }
+      },
+      {
+        type: 'context',
+        elements: [
+          {
+            type: 'mrkdwn',
+            text: `<${job.htmlUrl}|Open PR>`
+          }
+        ]
+      }
+    ]
+  };
+}
+
+function buildSecretDiscordPayload(job, secretTypes) {
+  return {
+    content: `Secret exposed in PR #${job.prNumber}`,
+    embeds: [
+      {
+        title: 'Secret exposed in PR',
+        url: job.htmlUrl,
+        color: 11928069,
+        fields: [
+          { name: 'Repository', value: job.fullName || 'unknown', inline: true },
+          { name: 'PR', value: `#${job.prNumber}`, inline: true },
+          { name: 'Author', value: `@${job.sender || 'unknown'}`, inline: true },
+          { name: 'Secret types found', value: secretTypes.join('\n').slice(0, 1024), inline: false }
+        ],
+        timestamp: new Date().toISOString()
+      }
+    ]
+  };
 }

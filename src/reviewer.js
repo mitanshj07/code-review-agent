@@ -1,6 +1,10 @@
+import crypto from 'node:crypto';
 import { createAppAuth } from '@octokit/auth-app';
 import { Octokit } from '@octokit/rest';
 import Groq from 'groq-sdk';
+import { redis } from './queue.js';
+import { buildDiffFromFiles } from './diffUtils.js';
+import { scanFileSizeFindings } from './fileGuards.js';
 
 const REVIEWABLE_EXTENSIONS = new Set([
   '.c',
@@ -29,19 +33,29 @@ const REVIEWABLE_EXTENSIONS = new Set([
 ]);
 
 export async function reviewPullRequest(job, config, logger) {
-  const octokit = await createInstallationClient(config, job.installationId);
-  const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
-    owner: job.owner,
-    repo: job.repo,
-    pull_number: job.prNumber,
-    per_page: 100
-  });
+  const files = job.files || await fetchPullRequestFiles(job, config);
+  const diff = job.diff || buildDiffFromFiles(files);
+  const diffHash = hashContent(diff);
+  const cacheKey = `review-cache:${diffHash}`;
+  const cachedFindings = await readJsonCache(cacheKey, logger);
+  if (cachedFindings) {
+    logger.info({ diffHash }, '[Cache] HIT - skipping Groq call.');
+    const dedupedCachedFindings = dedupeFindings(cachedFindings).slice(0, config.maxComments);
+    return {
+      headSha: job.headSha,
+      totalFiles: files.length,
+      filesReviewed: files.filter((file) => isReviewableFile(file)).length,
+      findings: dedupedCachedFindings,
+      summary: buildSummary(job, dedupedCachedFindings, files.filter((file) => isReviewableFile(file)).length, files.length)
+    };
+  }
+  logger.info({ diffHash }, '[Cache] MISS - reviewing changed files.');
 
   const reviewableFiles = files
     .filter((file) => isReviewableFile(file))
     .slice(0, config.maxFiles);
 
-  const findings = [];
+  const findings = [...scanFileSizeFindings(files)];
   for (const file of reviewableFiles) {
     const addedLines = parseAddedLines(file.patch || '');
     if (addedLines.length === 0) {
@@ -50,11 +64,12 @@ export async function reviewPullRequest(job, config, logger) {
 
     findings.push(...runDeterministicChecks(file.filename, addedLines, file.patch || ''));
 
-    const aiFindings = await reviewFileWithGroq(file, addedLines, config, logger);
+    const aiFindings = await reviewFileWithCache(file, addedLines, config, logger);
     findings.push(...aiFindings);
   }
 
   const dedupedFindings = dedupeFindings(findings).slice(0, config.maxComments);
+  await writeJsonCache(cacheKey, dedupedFindings, 604800, logger);
 
   return {
     headSha: job.headSha,
@@ -65,7 +80,17 @@ export async function reviewPullRequest(job, config, logger) {
   };
 }
 
-async function createInstallationClient(config, installationId) {
+export async function fetchPullRequestFiles(job, config) {
+  const octokit = await createInstallationClient(config, job.installationId);
+  return octokit.paginate(octokit.rest.pulls.listFiles, {
+    owner: job.owner,
+    repo: job.repo,
+    pull_number: job.prNumber,
+    per_page: 100
+  });
+}
+
+export async function createInstallationClient(config, installationId) {
   const auth = createAppAuth({
     appId: config.githubAppId,
     privateKey: config.githubPrivateKey,
@@ -143,6 +168,7 @@ function runDeterministicChecks(path, addedLines, patch) {
         title: 'Remove debug logging',
         body: 'This debug log can leak request data or create noisy production logs. Use structured logging with an appropriate level, or remove it before merging.',
         suggestion: '',
+        category: 'maintainability',
         source: 'static'
       });
     }
@@ -155,6 +181,7 @@ function runDeterministicChecks(path, addedLines, patch) {
         title: 'Hardcoded secret detected',
         body: 'This line appears to hardcode a credential or token. Move it to a secret manager or environment variable and rotate the exposed value.',
         suggestion: buildSecretSuggestion(content),
+        category: 'security',
         source: 'static'
       });
     }
@@ -167,6 +194,7 @@ function runDeterministicChecks(path, addedLines, patch) {
         title: 'Possible SQL injection',
         body: 'This query appears to concatenate or interpolate untrusted data into SQL. Use parameterized queries or prepared statements instead.',
         suggestion: buildSqlSuggestion(content),
+        category: 'security',
         source: 'static'
       });
     }
@@ -179,6 +207,7 @@ function runDeterministicChecks(path, addedLines, patch) {
         title: 'Async result is not awaited',
         body: 'This async call appears to be assigned or executed without `await` or an explicit returned promise. The code may continue before the operation finishes.',
         suggestion: buildAwaitSuggestion(content),
+        category: 'reliability',
         source: 'static'
       });
     }
@@ -190,6 +219,7 @@ function runDeterministicChecks(path, addedLines, patch) {
         severity: 'medium',
         title: 'Missing error handling around async work',
         body: 'This async control flow does not add visible error handling in the changed code. Add `try/catch`, return errors to the caller, or centralize failure handling.',
+        category: 'reliability',
         source: 'static'
       });
     }
@@ -265,6 +295,21 @@ function toEnvName(name) {
   return normalized || 'SECRET';
 }
 
+async function reviewFileWithCache(file, addedLines, config, logger) {
+  const fileHash = hashContent(`${file.filename}\n${file.patch || ''}`);
+  const cacheKey = `file-cache:${fileHash}`;
+  const cachedFindings = await readJsonCache(cacheKey, logger);
+  if (cachedFindings) {
+    logger.info({ file: file.filename, fileHash }, '[Cache] HIT - skipping Groq for file.');
+    return cachedFindings;
+  }
+
+  logger.info({ file: file.filename, fileHash }, '[Cache] MISS - calling Groq for file.');
+  const aiFindings = await reviewFileWithGroq(file, addedLines, config, logger);
+  await writeJsonCache(cacheKey, aiFindings, 259200, logger);
+  return aiFindings;
+}
+
 async function reviewFileWithGroq(file, addedLines, config, logger) {
   if (!config.groqApiKey) {
     return [];
@@ -318,6 +363,7 @@ async function reviewFileWithGroq(file, addedLines, config, logger) {
         title: cleanText(finding.title, 'Review finding'),
         body: cleanText(finding.body, 'Please review this changed line.'),
         suggestion: cleanSuggestion(finding.suggestion),
+        category: cleanText(finding.category, 'code-quality'),
         source: 'groq'
       }));
   } catch (error) {
@@ -336,7 +382,7 @@ function parseJsonObject(text) {
 }
 
 function normalizeSeverity(severity) {
-  return ['critical', 'high', 'medium', 'low'].includes(severity) ? severity : 'medium';
+  return ['error', 'warning', 'critical', 'high', 'medium', 'low'].includes(severity) ? severity : 'medium';
 }
 
 function cleanText(value, fallback) {
@@ -361,11 +407,11 @@ function cleanSuggestion(value) {
 
 function dedupeFindings(findings) {
   const seen = new Set();
-  const severityRank = { critical: 0, high: 1, medium: 2, low: 3 };
+  const severityRank = { error: 0, critical: 1, high: 2, warning: 3, medium: 4, low: 5 };
 
   return findings
     .filter((finding) => finding.path && finding.line && finding.body)
-    .sort((a, b) => severityRank[a.severity] - severityRank[b.severity])
+    .sort((a, b) => (severityRank[a.severity] ?? 9) - (severityRank[b.severity] ?? 9))
     .filter((finding) => {
       const key = `${finding.path}:${finding.line}:${finding.title.toLowerCase()}`;
       if (seen.has(key)) {
@@ -374,6 +420,28 @@ function dedupeFindings(findings) {
       seen.add(key);
       return true;
     });
+}
+
+function hashContent(content) {
+  return crypto.createHash('sha256').update(String(content || '')).digest('hex').slice(0, 16);
+}
+
+async function readJsonCache(cacheKey, logger) {
+  try {
+    const cached = await redis.get(cacheKey);
+    return cached ? JSON.parse(cached) : null;
+  } catch (error) {
+    logger.warn({ err: error, cacheKey }, 'Could not read review cache.');
+    return null;
+  }
+}
+
+async function writeJsonCache(cacheKey, value, ttlSeconds, logger) {
+  try {
+    await redis.setex(cacheKey, ttlSeconds, JSON.stringify(value));
+  } catch (error) {
+    logger.warn({ err: error, cacheKey }, 'Could not write review cache.');
+  }
 }
 
 function buildSummary(job, findings, filesReviewed, totalFiles) {
@@ -386,7 +454,7 @@ function buildSummary(job, findings, filesReviewed, totalFiles) {
     return memo;
   }, {});
 
-  const severitySummary = ['critical', 'high', 'medium', 'low']
+  const severitySummary = ['error', 'critical', 'high', 'warning', 'medium', 'low']
     .filter((severity) => counts[severity])
     .map((severity) => `${counts[severity]} ${severity}`)
     .join(', ');

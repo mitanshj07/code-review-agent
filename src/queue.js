@@ -116,6 +116,47 @@ export async function closeQueue() {
   await drainQueue();
 }
 
+export const redis = {
+  get: async (key) => {
+    if (!hasRedis()) {
+      return null;
+    }
+    return redisCommand('GET', key);
+  },
+  set: async (key, value, ...args) => {
+    if (!hasRedis()) {
+      return null;
+    }
+    return redisCommand('SET', key, value, ...args);
+  },
+  setex: async (key, seconds, value) => {
+    if (!hasRedis()) {
+      return null;
+    }
+    return redisCommand('SETEX', key, seconds, value);
+  },
+  mget: async (keys) => {
+    if (!hasRedis() || !keys.length) {
+      return [];
+    }
+    return redisCommand('MGET', ...keys);
+  },
+  keys: async (pattern) => {
+    if (!hasRedis()) {
+      return [];
+    }
+    return redisCommand('KEYS', pattern);
+  },
+  dbsize: async () => {
+    if (!hasRedis()) {
+      return state.localQueue.length;
+    }
+    return redisCommand('DBSIZE');
+  },
+  command: redisCommand,
+  isConfigured: hasRedis
+};
+
 function hasRedis() {
   return Boolean(state.redisUrl && state.redisToken);
 }

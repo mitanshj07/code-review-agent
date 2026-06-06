@@ -7,11 +7,18 @@ import pinoHttp from 'pino-http';
 import { createHealthRouter } from './health.js';
 import { configureQueue, closeQueue, enqueueReview, enqueueConversationalReply } from './queue.js';
 import { createWebhookHandler } from './webhook.js';
-import { reviewPullRequest } from './reviewer.js';
-import { postReviewResult } from './commenter.js';
+import { createInstallationClient, fetchPullRequestFiles, reviewPullRequest } from './reviewer.js';
+import { postIssueComment, postReviewResult, postSecretAlertComment } from './commenter.js';
 import { createDashboardRouter } from './dashboardRouter.js';
 import { handleConversationalReply } from './chatWorker.js';
-import { sendSecurityAlertsForReview } from './securityAlerts.js';
+import { sendSecretExposureAlert, sendSecurityAlertsForReview } from './securityAlerts.js';
+import { buildDiffFromFiles, extractChangedFilePaths } from './diffUtils.js';
+import { scanForSecrets } from './secretScanner.js';
+import { analyzePRSize, buildPRSizeCard, buildTooLargePRComment } from './prSizeGuard.js';
+import { lintPullRequestCommits, buildCommitLintSection } from './commitLinter.js';
+import { labelPR } from './autoLabeler.js';
+import { assignReviewers } from './autoAssign.js';
+import { startStalePRReminder } from './stalePRReminder.js';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const config = loadConfig();
@@ -24,10 +31,50 @@ configureQueue({
   handlers: {
     pull_request_review: async (job) => {
       logger.info({ job }, 'Starting pull request review.');
-      const result = await reviewPullRequest(job, config, logger);
+      const octokit = await createInstallationClient(config, job.installationId);
+      const files = await fetchPullRequestFiles(job, config);
+      const diff = buildDiffFromFiles(files);
+      const sizeData = analyzePRSize(diff);
+      const changedFiles = extractChangedFilePaths(diff);
+
+      if (sizeData.shouldBlock) {
+        await postIssueComment(octokit, job, buildTooLargePRComment(sizeData));
+        logger.warn({ job, sizeData }, 'Skipped oversized PR to preserve API rate limits.');
+        return;
+      }
+
+      await postIssueComment(octokit, job, buildPRSizeCard(sizeData));
+
+      const secretFindings = scanForSecrets(diff);
+      if (secretFindings.length && !job.immediateSecretFindings?.length) {
+        await postSecretAlertComment(octokit, job, secretFindings);
+        await sendSecretExposureAlert(job, secretFindings, config, logger);
+      }
+
+      const result = await reviewPullRequest({ ...job, files, diff }, config, logger);
+      const secretReviewFindings = secretFindings.map((finding) => ({
+        ...finding,
+        severity: 'error'
+      }));
+      if (secretReviewFindings.length) {
+        result.findings = [...secretReviewFindings, ...result.findings].slice(0, config.maxComments);
+        result.requestChanges = true;
+        result.summary = `CodeScope found ${secretReviewFindings.length} exposed secret(s) and ${Math.max(0, result.findings.length - secretReviewFindings.length)} additional issue(s).`;
+      }
+
+      const commitIssues = await lintPullRequestCommits(octokit, job.owner, job.repo, job.prNumber, logger);
+      const commitLintSection = buildCommitLintSection(commitIssues);
+      result.extraReviewSections = commitLintSection ? [commitLintSection] : [];
+
+      const labelResult = await labelPR(octokit, job.owner, job.repo, job.prNumber, diff, result.findings, sizeData, {
+        groqApiKey: config.groqApiKey,
+        title: job.prTitle,
+        logger
+      });
       const alertResult = await sendSecurityAlertsForReview(job, result, config, logger);
       const postResult = await postReviewResult(job, result, config, logger);
-      logger.info({ job, result, alertResult, postResult }, 'Finished pull request review.');
+      const assignResult = await assignReviewers(octokit, job.owner, job.repo, job.prNumber, job.sender, changedFiles, logger);
+      logger.info({ job, result, labelResult, alertResult, postResult, assignResult }, 'Finished pull request review.');
     },
     conversational_reply: async (job) => {
       logger.info({ job }, 'Starting conversational PR reply.');
@@ -37,11 +84,10 @@ configureQueue({
   }
 });
 
+startStalePRReminder(config, logger);
+
 const app = express();
 app.disable('x-powered-by');
-app.get('/health', (_req, res) => {
-  res.status(200).type('text/plain').send('OK');
-});
 app.use(createCorsMiddleware(config));
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(pinoHttp({ logger }));

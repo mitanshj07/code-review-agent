@@ -1,8 +1,15 @@
 import crypto from 'node:crypto';
+import { createInstallationClient } from './reviewer.js';
+import { buildDiffFromFiles } from './diffUtils.js';
+import { scanForSecrets } from './secretScanner.js';
+import { postBranchNameWarning, postSecretAlertComment } from './commenter.js';
+import { sendSecretExposureAlert } from './securityAlerts.js';
+import { redis } from './queue.js';
 
 const REVIEWABLE_ACTIONS = new Set(['opened', 'synchronize', 'reopened', 'ready_for_review']);
 const BOT_MENTION = '@codescopeboit';
 const BOT_LOGINS = new Set(['codescopeboit[bot]', 'codescopeboit']);
+const BRANCH_NAME_PATTERN = /^(feat|fix|hotfix|chore|refactor|docs|test|ci)\/[a-z0-9-]+$/;
 
 export function createWebhookHandler({ config, logger, enqueueReview, enqueueConversationalReply }) {
   return async function webhookHandler(req, res) {
@@ -59,6 +66,7 @@ export function createWebhookHandler({ config, logger, enqueueReview, enqueueCon
       return res.status(400).json({ error: 'Missing GitHub App installation id' });
     }
 
+    const octokit = await createInstallationClient(config, payload.installation.id);
     const job = {
       deliveryId,
       action: payload.action,
@@ -67,12 +75,21 @@ export function createWebhookHandler({ config, logger, enqueueReview, enqueueCon
       repo: payload.repository.name,
       fullName: payload.repository.full_name,
       prNumber: pullRequest.number,
+      prTitle: pullRequest.title || '',
       htmlUrl: pullRequest.html_url,
       headSha: pullRequest.head.sha,
       baseSha: pullRequest.base.sha,
+      branchName: pullRequest.head.ref,
       sender: payload.sender?.login || 'unknown',
       enqueuedAt: new Date().toISOString()
     };
+
+    if (payload.action === 'opened') {
+      await trackPROpened(job, logger);
+      await enforceBranchName(octokit, job, logger);
+    }
+
+    await runImmediateSecretScan(octokit, job, config, logger);
 
     const queueResult = await enqueueReview(job);
     logger.info({ job, queueResult }, 'Pull request review job accepted.');
@@ -84,6 +101,50 @@ export function createWebhookHandler({ config, logger, enqueueReview, enqueueCon
       pullRequest: job.prNumber
     });
   };
+}
+
+async function runImmediateSecretScan(octokit, job, config, logger) {
+  try {
+    const files = await octokit.paginate(octokit.rest.pulls.listFiles, {
+      owner: job.owner,
+      repo: job.repo,
+      pull_number: job.prNumber,
+      per_page: 100
+    });
+    const diff = buildDiffFromFiles(files);
+    const secretFindings = scanForSecrets(diff);
+    if (!secretFindings.length) {
+      return;
+    }
+
+    job.immediateSecretFindings = secretFindings;
+    await postSecretAlertComment(octokit, job, secretFindings);
+    await sendSecretExposureAlert(job, secretFindings, config, logger);
+    logger.warn({ repository: job.fullName, prNumber: job.prNumber, count: secretFindings.length }, 'Immediate secret scan found credentials.');
+  } catch (error) {
+    logger.warn({ err: error, repository: job.fullName, prNumber: job.prNumber }, 'Immediate secret scan failed; queued review will continue.');
+  }
+}
+
+async function enforceBranchName(octokit, job, logger) {
+  if (BRANCH_NAME_PATTERN.test(job.branchName || '')) {
+    return;
+  }
+
+  try {
+    await postBranchNameWarning(octokit, job, job.branchName || 'unknown');
+    logger.info({ repository: job.fullName, prNumber: job.prNumber, branchName: job.branchName }, 'Posted branch naming warning.');
+  } catch (error) {
+    logger.warn({ err: error, repository: job.fullName, prNumber: job.prNumber }, 'Could not post branch naming warning.');
+  }
+}
+
+async function trackPROpened(job, logger) {
+  try {
+    await redis.setex(`pr-opened:${job.owner}/${job.repo}/${job.prNumber}`, 30 * 24 * 60 * 60, String(Date.now()));
+  } catch (error) {
+    logger.warn({ err: error, repository: job.fullName, prNumber: job.prNumber }, 'Could not track PR opened time.');
+  }
 }
 
 async function handleIssueComment({ payload, deliveryId, logger, enqueueConversationalReply, res }) {
