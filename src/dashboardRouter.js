@@ -83,6 +83,111 @@ const mockScans = [
   }
 ];
 
+const mockLeaderboard = {
+  all: [
+    {
+      rank: 1,
+      githubLogin: 'sana-dev',
+      displayName: 'Sana Patel',
+      primaryRepository: 'payment-gateway',
+      prsReviewed: 34,
+      bugsFlagged: 3,
+      criticalBlocked: 0,
+      cleanPrRate: 94,
+      hoursSaved: 48,
+      score: 98
+    },
+    {
+      rank: 2,
+      githubLogin: 'mitanshj07',
+      displayName: 'Mitansh Jain',
+      primaryRepository: 'code-review-agent',
+      prsReviewed: 29,
+      bugsFlagged: 5,
+      criticalBlocked: 1,
+      cleanPrRate: 88,
+      hoursSaved: 41,
+      score: 91
+    },
+    {
+      rank: 3,
+      githubLogin: 'alex-api',
+      displayName: 'Alex Rivera',
+      primaryRepository: 'payment-gateway',
+      prsReviewed: 26,
+      bugsFlagged: 8,
+      criticalBlocked: 2,
+      cleanPrRate: 79,
+      hoursSaved: 35,
+      score: 82
+    },
+    {
+      rank: 4,
+      githubLogin: 'nora-platform',
+      displayName: 'Nora Chen',
+      primaryRepository: 'code-review-agent',
+      prsReviewed: 21,
+      bugsFlagged: 10,
+      criticalBlocked: 3,
+      cleanPrRate: 71,
+      hoursSaved: 28,
+      score: 74
+    }
+  ],
+  'code-review-agent': [
+    {
+      rank: 1,
+      githubLogin: 'mitanshj07',
+      displayName: 'Mitansh Jain',
+      primaryRepository: 'code-review-agent',
+      prsReviewed: 29,
+      bugsFlagged: 5,
+      criticalBlocked: 1,
+      cleanPrRate: 88,
+      hoursSaved: 41,
+      score: 91
+    },
+    {
+      rank: 2,
+      githubLogin: 'nora-platform',
+      displayName: 'Nora Chen',
+      primaryRepository: 'code-review-agent',
+      prsReviewed: 21,
+      bugsFlagged: 10,
+      criticalBlocked: 3,
+      cleanPrRate: 71,
+      hoursSaved: 28,
+      score: 74
+    }
+  ],
+  'payment-gateway': [
+    {
+      rank: 1,
+      githubLogin: 'sana-dev',
+      displayName: 'Sana Patel',
+      primaryRepository: 'payment-gateway',
+      prsReviewed: 34,
+      bugsFlagged: 3,
+      criticalBlocked: 0,
+      cleanPrRate: 94,
+      hoursSaved: 48,
+      score: 98
+    },
+    {
+      rank: 2,
+      githubLogin: 'alex-api',
+      displayName: 'Alex Rivera',
+      primaryRepository: 'payment-gateway',
+      prsReviewed: 26,
+      bugsFlagged: 8,
+      criticalBlocked: 2,
+      cleanPrRate: 79,
+      hoursSaved: 35,
+      score: 82
+    }
+  ]
+};
+
 export function createDashboardRouter({ db, logger = console, config = process.env } = {}) {
   const router = express.Router();
   const dashboardConfig = normalizeConfig(config);
@@ -183,6 +288,18 @@ export function createDashboardRouter({ db, logger = console, config = process.e
       res.json({ scans });
     } catch (error) {
       logger.error?.({ err: error }, 'Could not load scan activity.');
+      next(error);
+    }
+  });
+
+  router.get('/api/leaderboard', requireSession(dashboardConfig), async (req, res, next) => {
+    try {
+      const repository = normalizeRepository(req.query.repository);
+      const limit = clampNumber(Number(req.query.limit || 10), 1, 50);
+      const leaderboard = db ? await readLeaderboardFromDatabase(db, repository, limit) : readMockLeaderboard(repository, limit);
+      res.json({ leaderboard });
+    } catch (error) {
+      logger.error?.({ err: error }, 'Could not load developer leaderboard.');
       next(error);
     }
   });
@@ -353,6 +470,35 @@ async function readScansFromDatabase(db, repository, limit) {
   return rows(result);
 }
 
+async function readLeaderboardFromDatabase(db, repository, limit) {
+  const params = repository === 'all' ? [limit] : [repository, limit];
+  const repositoryWhere = repository === 'all' ? '' : 'where primary_repository = $1';
+  const limitParam = repository === 'all' ? '$1' : '$2';
+
+  const result = await db.query(
+    `
+      select
+        rank,
+        github_login as "githubLogin",
+        display_name as "displayName",
+        primary_repository as "primaryRepository",
+        prs_reviewed as "prsReviewed",
+        bugs_flagged as "bugsFlagged",
+        critical_blocked as "criticalBlocked",
+        clean_pr_rate as "cleanPrRate",
+        hours_saved as "hoursSaved",
+        score
+      from developer_quality_leaderboard
+      ${repositoryWhere}
+      order by score desc, clean_pr_rate desc
+      limit ${limitParam}
+    `,
+    params
+  );
+
+  return rows(result);
+}
+
 function readMockMetrics(repository) {
   return {
     repository,
@@ -364,6 +510,10 @@ function readMockScans(repository, limit) {
   return mockScans
     .filter((scan) => repository === 'all' || scan.repositoryName === repository)
     .slice(0, limit);
+}
+
+function readMockLeaderboard(repository, limit) {
+  return (mockLeaderboard[repository] || mockLeaderboard.all).slice(0, limit);
 }
 
 function normalizeRepository(value) {

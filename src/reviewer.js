@@ -142,6 +142,7 @@ function runDeterministicChecks(path, addedLines, patch) {
         severity: 'low',
         title: 'Remove debug logging',
         body: 'This debug log can leak request data or create noisy production logs. Use structured logging with an appropriate level, or remove it before merging.',
+        suggestion: '',
         source: 'static'
       });
     }
@@ -153,6 +154,7 @@ function runDeterministicChecks(path, addedLines, patch) {
         severity: 'high',
         title: 'Hardcoded secret detected',
         body: 'This line appears to hardcode a credential or token. Move it to a secret manager or environment variable and rotate the exposed value.',
+        suggestion: buildSecretSuggestion(content),
         source: 'static'
       });
     }
@@ -164,6 +166,7 @@ function runDeterministicChecks(path, addedLines, patch) {
         severity: 'critical',
         title: 'Possible SQL injection',
         body: 'This query appears to concatenate or interpolate untrusted data into SQL. Use parameterized queries or prepared statements instead.',
+        suggestion: buildSqlSuggestion(content),
         source: 'static'
       });
     }
@@ -175,6 +178,7 @@ function runDeterministicChecks(path, addedLines, patch) {
         severity: 'medium',
         title: 'Async result is not awaited',
         body: 'This async call appears to be assigned or executed without `await` or an explicit returned promise. The code may continue before the operation finishes.',
+        suggestion: buildAwaitSuggestion(content),
         source: 'static'
       });
     }
@@ -216,6 +220,51 @@ function looksLikeMissingAwait(line) {
   return asyncCall.test(line) && /^(const|let|var)\s+\w+\s*=|;\s*$/.test(line);
 }
 
+function buildAwaitSuggestion(line) {
+  if (/\bawait\b/.test(line)) {
+    return null;
+  }
+
+  if (/=\s*/.test(line)) {
+    return line.replace(/=\s*/, '= await ');
+  }
+
+  return line.replace(/^(\s*)/, '$1await ');
+}
+
+function buildSecretSuggestion(line) {
+  const declaration = line.match(/^(\s*(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*)['"`][^'"`]+['"`](.*)$/);
+  if (declaration) {
+    return `${declaration[1]}process.env.${toEnvName(declaration[2])}${declaration[3]}`;
+  }
+
+  const property = line.match(/^(\s*['"]?([A-Za-z_$][\w$-]*)['"]?\s*:\s*)['"`][^'"`]+['"`](.*)$/);
+  if (property) {
+    return `${property[1]}process.env.${toEnvName(property[2])}${property[3]}`;
+  }
+
+  return null;
+}
+
+function buildSqlSuggestion(line) {
+  if (!/`/.test(line) || !/\$\{[^}]+}/.test(line)) {
+    return null;
+  }
+
+  const parameterized = line.replace(/\$\{[^}]+}/g, '?');
+  return parameterized === line ? null : `${parameterized} // Pass the dynamic values as query parameters.`;
+}
+
+function toEnvName(name) {
+  const normalized = String(name || 'SECRET')
+    .replace(/([a-z0-9])([A-Z])/g, '$1_$2')
+    .replace(/[^A-Za-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .toUpperCase();
+
+  return normalized || 'SECRET';
+}
+
 async function reviewFileWithGroq(file, addedLines, config, logger) {
   if (!config.groqApiKey) {
     return [];
@@ -243,7 +292,8 @@ async function reviewFileWithGroq(file, addedLines, config, logger) {
             'You are a senior code review agent for GitHub pull requests.',
             'Find only actionable correctness, security, reliability, or maintainability issues in added lines.',
             'Do not comment on style-only issues. Do not invent context outside the diff.',
-            'Return valid JSON only with shape {"findings":[{"line":number,"severity":"critical|high|medium|low","title":string,"body":string}]}',
+            'Return valid JSON only with shape {"findings":[{"line":number,"severity":"critical|high|medium|low","title":string,"body":string,"suggestion":string|null}]}',
+            'When a safe one-line fix is obvious, set suggestion to the exact replacement text for that changed line without markdown fences. Otherwise use null.',
             'Every line must be one of the provided added_lines line numbers.'
           ].join(' ')
         },
@@ -267,6 +317,7 @@ async function reviewFileWithGroq(file, addedLines, config, logger) {
         severity: normalizeSeverity(finding.severity),
         title: cleanText(finding.title, 'Review finding'),
         body: cleanText(finding.body, 'Please review this changed line.'),
+        suggestion: cleanSuggestion(finding.suggestion),
         source: 'groq'
       }));
   } catch (error) {
@@ -295,6 +346,17 @@ function cleanText(value, fallback) {
 
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed.slice(0, 900) : fallback;
+}
+
+function cleanSuggestion(value) {
+  if (typeof value !== 'string') {
+    return null;
+  }
+
+  return value
+    .replace(/^```(?:suggestion|[\w-]+)?\s*/i, '')
+    .replace(/```$/i, '')
+    .slice(0, 1600);
 }
 
 function dedupeFindings(findings) {

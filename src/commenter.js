@@ -92,13 +92,19 @@ async function createInstallationClient(config, installationId) {
 }
 
 function formatFinding(finding) {
-  return [
+  const body = [
     `**${finding.severity.toUpperCase()}: ${finding.title}**`,
     '',
     finding.body,
     '',
     `_Source: ${finding.source === 'static' ? 'deterministic check' : 'Groq review'}_`
-  ].join('\n');
+  ];
+
+  if (hasSuggestion(finding)) {
+    body.push('', '```suggestion', sanitizeSuggestion(finding.suggestion), '```');
+  }
+
+  return body.join('\n');
 }
 
 function sanitizeMarkdownReply(markdownReply) {
@@ -108,4 +114,12 @@ function sanitizeMarkdownReply(markdownReply) {
   }
 
   return reply.slice(0, 6000);
+}
+
+function hasSuggestion(finding) {
+  return Object.prototype.hasOwnProperty.call(finding, 'suggestion') && finding.suggestion !== null && finding.suggestion !== undefined;
+}
+
+function sanitizeSuggestion(suggestion) {
+  return String(suggestion).replace(/```/g, '` ` `').slice(0, 1600);
 }

@@ -11,6 +11,7 @@ import { reviewPullRequest } from './reviewer.js';
 import { postReviewResult } from './commenter.js';
 import { createDashboardRouter } from './dashboardRouter.js';
 import { handleConversationalReply } from './chatWorker.js';
+import { sendSecurityAlertsForReview } from './securityAlerts.js';
 
 const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 const config = loadConfig();
@@ -24,8 +25,9 @@ configureQueue({
     pull_request_review: async (job) => {
       logger.info({ job }, 'Starting pull request review.');
       const result = await reviewPullRequest(job, config, logger);
+      const alertResult = await sendSecurityAlertsForReview(job, result, config, logger);
       const postResult = await postReviewResult(job, result, config, logger);
-      logger.info({ job, result, postResult }, 'Finished pull request review.');
+      logger.info({ job, result, alertResult, postResult }, 'Finished pull request review.');
     },
     conversational_reply: async (job) => {
       logger.info({ job }, 'Starting conversational PR reply.');
@@ -40,6 +42,7 @@ app.disable('x-powered-by');
 app.get('/health', (_req, res) => {
   res.status(200).type('text/plain').send('OK');
 });
+app.use(createCorsMiddleware(config));
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(pinoHttp({ logger }));
 app.use(createHealthRouter());
@@ -79,7 +82,11 @@ function loadConfig() {
     upstashRedisRestToken: process.env.UPSTASH_REDIS_REST_TOKEN || '',
     maxFiles: Number(process.env.MAX_FILES || 20),
     maxComments: Number(process.env.MAX_COMMENTS || 12),
-    commentOnClean: String(process.env.COMMENT_ON_CLEAN || 'false').toLowerCase() === 'true'
+    commentOnClean: String(process.env.COMMENT_ON_CLEAN || 'false').toLowerCase() === 'true',
+    securityAlertWebhookUrl: process.env.SECURITY_ALERT_WEBHOOK_URL || process.env.DISCORD_WEBHOOK_URL || process.env.SLACK_WEBHOOK_URL || '',
+    securityAlertProvider: process.env.SECURITY_ALERT_PROVIDER || '',
+    securityAlertMinSeverity: (process.env.SECURITY_ALERT_MIN_SEVERITY || 'high').toLowerCase(),
+    dashboardCorsOrigins: parseCsv(process.env.DASHBOARD_CORS_ORIGINS || 'http://localhost:3000')
   };
 }
 
@@ -102,4 +109,30 @@ function loadPrivateKey() {
   }
 
   return fs.readFileSync(keyPath, 'utf8');
+}
+
+function createCorsMiddleware(config) {
+  return (req, res, next) => {
+    const origin = req.get('origin');
+    if (origin && config.dashboardCorsOrigins.includes(origin)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Access-Control-Allow-Credentials', 'true');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Vary', 'Origin');
+    }
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+
+    return next();
+  };
+}
+
+function parseCsv(value) {
+  return String(value || '')
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter(Boolean);
 }
