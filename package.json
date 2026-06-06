@@ -1,0 +1,32 @@
+{
+  "name": "code-review-agent",
+  "version": "1.0.0",
+  "description": "Autonomous GitHub App code review agent powered by Groq and Upstash Redis.",
+  "type": "module",
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "health": "node -e \"fetch('http://localhost:' + (process.env.PORT || 3000) + '/health').then(r => r.json()).then(console.log)\""
+  },
+  "keywords": [
+    "github-app",
+    "code-review",
+    "groq",
+    "upstash"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@octokit/auth-app": "^8.1.0",
+    "@octokit/rest": "^22.0.0",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "groq-sdk": "^0.36.0",
+    "helmet": "^8.1.0",
+    "pino": "^10.1.0",
+    "pino-http": "^11.0.0"
+  }
+}
